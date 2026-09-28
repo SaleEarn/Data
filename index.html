@@ -4141,6 +4141,7 @@ async function seLoadPublicCatalog(force=false){
       SE_PUBLIC_CATALOG_READY=true;
       PUBLIC_PRODUCTS_READY=true;
       try{await seLoadRealProductSalesCounts(true)}catch(e){console.warn('Public sales count hydration:',e?.message||e)}
+      try{const currentRoute=routeNow();if(currentRoute==='market'||currentRoute.startsWith('product/')||currentRoute.startsWith('seller/'))setTimeout(()=>render(),0)}catch(e){}
       return true;
     }catch(e){
       const fallback=(Array.isArray(SE_PUBLIC_CATALOG)&&SE_PUBLIC_CATALOG.length)
@@ -13617,6 +13618,11 @@ async function seSaveProductSecureRpc(product){
     && Number(row.file_count||0)===Number(payload.file_count||0)
     && JSON.stringify(Array.isArray(row.file_titles)?row.file_titles:[])===JSON.stringify(expectedTitles);
   if(!valid)throw new Error('Supabase verification failed: saved product details do not match the seller form');
+  try{
+    SE_PUBLIC_CATALOG_READY=false;SE_PUBLIC_CATALOG_PROMISE=null;
+    await seLoadPublicCatalog(true);
+    if(routeNow().startsWith('product/')||routeNow()==='market'||routeNow().startsWith('seller/'))render();
+  }catch(e){console.warn('Authoritative product refresh delayed',e)}
   return true;
  }catch(e){
   console.error('Secure product save failed:',e);
@@ -13705,17 +13711,17 @@ const metadataKeys=['title','description','category','tags','oldPrice','links','
 product=function(id){
   const visible=baseProduct(id);
   if(!visible)return visible;
+  /* Once Supabase catalog is ready, its normalized columns are authoritative.
+     Never overwrite them with an older shared/local cache. */
+  if(SE_PUBLIC_CATALOG_READY&&Array.isArray(SE_PUBLIC_CATALOG))return visible;
   const full=(Array.isArray(S.products)?S.products:[]).find(x=>String(x?.id)===String(id));
   if(!full||full===visible)return visible;
   const merged={...visible};
   for(const key of metadataKeys){
-    if(Object.prototype.hasOwnProperty.call(full,key)){
+    const current=merged[key],missing=current===undefined||current===null||current===''||(Array.isArray(current)&&current.length===0);
+    if(missing&&Object.prototype.hasOwnProperty.call(full,key)){
       try{merged[key]=structuredClone(full[key])}catch{merged[key]=full[key]}
     }
-  }
-  /* Never let a local cache bypass marketplace moderation/visibility. */
-  for(const key of ['status','approvalStatus','publicLive','hiddenByAdmin']){
-    if(Object.prototype.hasOwnProperty.call(visible,key))merged[key]=visible[key];
   }
   return merged;
 };
