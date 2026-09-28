@@ -3775,7 +3775,7 @@ async function syncNormalizedCore(){
    const dedup=[...new Map(rows.map(x=>[String(x.id),x])).values()];
    const r=await supabaseClient.from('products').upsert(dedup,{onConflict:'id'});
    if(r.error)console.warn('products sync:',r.error.message);
-   else for(const productRow of livePs)await seSyncProductFiles(productRow,me.id);
+   else {/* product files are written only by the secure RPC */}
   }
   const buyerIds=new Set([me.id,u?.id,u?.userId].filter(Boolean).map(String));
   // Buyers create their own normalized order rows. Sellers read those rows through RLS;
@@ -12112,7 +12112,7 @@ window.adminProductCheckAction=async function(id,kind){
             ? await window.supabaseClient.from('products').update(syncRow).eq('id',String(pid))
             : (owner ? await window.supabaseClient.from('products').insert({...syncRow,seller_id:owner}) : {error:new Error('Seller owner ID could not be resolved')});
           if(wr.error)throw wr.error;
-          if(owner)await seSyncProductFiles(decided,owner);
+          /* product files are written only by the secure RPC */
         }
         /* Do not wait for a second full catalog fetch to make the approved item
            visible.  Admin approval is already authoritative in Supabase; update the
@@ -13603,7 +13603,21 @@ async function seSaveProductSecureRpc(product){
  try{
   const {data,error}=await supabaseClient.rpc('saleearn_save_product',{p_product:payload});
   if(error)throw error;
-  return data?.ok===true;
+  if(data?.ok!==true)throw new Error('Secure save did not return confirmation');
+  const check=await supabaseClient.from('products').select('id,category,tags,old_price,file_size_value,file_size_unit,file_count,file_titles,coupon,updated_at').eq('id',String(product.id)).maybeSingle();
+  if(check.error)throw check.error;
+  const row=check.data||{};
+  const expectedTitles=payload.file_titles||[];
+  const valid=row.id===String(product.id)
+    && String(row.category||'')===String(payload.category||'')
+    && JSON.stringify(Array.isArray(row.tags)?row.tags:[])===JSON.stringify(payload.tags||[])
+    && Number(row.old_price||0)===Number(payload.old_price||0)
+    && Number(row.file_size_value||0)===Number(payload.file_size_value||0)
+    && String(row.file_size_unit||'')===String(payload.file_size_unit||'')
+    && Number(row.file_count||0)===Number(payload.file_count||0)
+    && JSON.stringify(Array.isArray(row.file_titles)?row.file_titles:[])===JSON.stringify(expectedTitles);
+  if(!valid)throw new Error('Supabase verification failed: saved product details do not match the seller form');
+  return true;
  }catch(e){
   console.error('Secure product save failed:',e);
   toast('Supabase save failed: '+String(e?.message||'unknown error'));
@@ -13611,6 +13625,9 @@ async function seSaveProductSecureRpc(product){
  }
 }
 window.seSaveProductSecureRpc=seSaveProductSecureRpc;
+/* The legacy direct REST writer also tried to insert product_files and received
+   403 by design. Product writes now go only through saleearn_save_product RPC. */
+window.seSyncPublishedProduct=async function(){return true;};
 
 /* Final product persistence hardening: keep every seller-entered field intact
    through publish, navigation, public-catalog refresh and cloud synchronization. */
