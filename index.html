@@ -3693,6 +3693,57 @@ function sePackProductDescription(product){
  const encoded=seProductMetaEncode(meta);
  return encoded?(clean+(clean?'\n\n':'')+'[['+SE_PRODUCT_META_MARKER+':'+encoded+']]'):(clean||null);
 }
+function seProductCloudRow(product,ownerId,status){
+ const p=product||{};
+ const links=Array.isArray(p.links)?p.links.map(x=>String(x||'').trim()).filter(Boolean):[];
+ const titles=Array.isArray(p.linkTitles)?p.linkTitles.slice(0,links.length).map((x,i)=>String(x||'').trim()||`File ${i+1}`):links.map((_,i)=>`File ${i+1}`);
+ const unit=['MB','GB'].includes(String(p.fileSizeUnit||''))?String(p.fileSizeUnit):null;
+ const size=Number(p.fileSizeValue);
+ return {
+  id:String(p.id),seller_id:ownerId,title:String(p.title||'Untitled'),
+  description:sePackProductDescription(p),price:Number(p.price||0),status,
+  file_url:links[0]||p.deliveryUrl||null,image_url:p.image||null,
+  category:p.category||null,tags:Array.isArray(p.tags)?p.tags:[],
+  old_price:Number.isFinite(Number(p.oldPrice))?Number(p.oldPrice):null,
+  file_size_value:Number.isFinite(size)&&size>0?size:null,file_size_unit:unit,
+  file_count:Math.min(50,Math.max(0,Number(p.fileCount||links.length||0))),
+  file_titles:titles,faq:Array.isArray(p.faq)?p.faq:[],coupon:p.coupon||null,
+  metadata:{rightsConfirmed:!!p.rightsConfirmed,badge:p.badge||null,featured:!!p.featured},
+  updated_at:new Date().toISOString()
+ };
+}
+async function seSyncProductFiles(product,ownerId){
+ if(!supabaseClient||!product?.id||!ownerId)return false;
+ const links=Array.isArray(product.links)?product.links.map(x=>String(x||'').trim()).filter(Boolean):[];
+ const titles=Array.isArray(product.linkTitles)?product.linkTitles:[];
+ try{
+  const rows=links.map((url,i)=>({id:String(product.id)+':'+i,product_id:String(product.id),seller_id:ownerId,title:String(titles[i]||`File ${i+1}`),secret_url:url,file_size_value:Number(product.fileSizeValue)||null,file_size_unit:['MB','GB'].includes(String(product.fileSizeUnit||''))?String(product.fileSizeUnit):null,position:i,updated_at:new Date().toISOString()}));
+  if(rows.length){const w=await supabaseClient.from('product_files').upsert(rows,{onConflict:'id'});if(w.error)throw w.error;}
+  const keep=rows.map(x=>x.id);
+  let q=supabaseClient.from('product_files').delete().eq('product_id',String(product.id)).eq('seller_id',ownerId);
+  if(keep.length)q=q.not('id','in','('+keep.map(x=>'"'+String(x).replace(/"/g,'')+'"').join(',')+')');
+  const d=await q;if(d.error)throw d.error;
+  return true;
+ }catch(e){console.warn('Product file sync delayed:',e?.message||e);return false}
+}
+function seApplyCloudProductMetadata(base,row){
+ const old=base||{},decoded=seUnpackProductDescription(row?.description),packed=decoded.meta||{},metadata=row?.metadata&&typeof row.metadata==='object'?row.metadata:{};
+ const tags=Array.isArray(row?.tags)?row.tags:(Array.isArray(packed.tags)?packed.tags:(Array.isArray(old.tags)?old.tags:[]));
+ const titles=Array.isArray(row?.file_titles)?row.file_titles:(Array.isArray(packed.linkTitles)?packed.linkTitles:(Array.isArray(old.linkTitles)?old.linkTitles:[]));
+ const faq=Array.isArray(row?.faq)?row.faq:(Array.isArray(packed.faq)?packed.faq:(Array.isArray(old.faq)?old.faq:[]));
+ const sizeValue=row?.file_size_value??packed.fileSizeValue??old.fileSizeValue;
+ const sizeUnit=row?.file_size_unit??packed.fileSizeUnit??old.fileSizeUnit;
+ const links=Array.isArray(old.links)&&old.links.length?old.links:(Array.isArray(packed.links)&&packed.links.length?packed.links:(row?.file_url?[row.file_url]:[]));
+ return {...old,...packed,
+  description:merged.description??old.description??'',category:row?.category??packed.category??old.category??'',tags,
+  oldPrice:row?.old_price??packed.oldPrice??old.oldPrice,fileSizeValue:sizeValue,fileSizeUnit:sizeUnit,
+  fileSize:(sizeValue&&sizeUnit)?`${Number(sizeValue)} ${sizeUnit}`:(packed.fileSize||old.fileSize||''),
+  fileCount:Number(row?.file_count??packed.fileCount??old.fileCount??links.length),
+  linkTitles:titles,links,faq,coupon:row?.coupon??packed.coupon??old.coupon??null,
+  rightsConfirmed:metadata.rightsConfirmed??packed.rightsConfirmed??old.rightsConfirmed,
+  badge:metadata.badge??packed.badge??old.badge,featured:metadata.featured??packed.featured??old.featured
+ };
+}
 async function syncNormalizedCore(){
  if(NORMALIZED_SYNC_BUSY||!SUPABASE_READY||ONLINE_LOADING)return;
  const needs=new Set(NORMALIZED_SYNC_KEYS);NORMALIZED_SYNC_KEYS.clear();
@@ -3718,12 +3769,13 @@ async function syncNormalizedCore(){
   const deletedPs=needs.has('products')?(S.deletedProducts||[]).filter(x=>normalizedCurrentOwnerId(x?.sellerId)===me.id):[];
   if(livePs.length||deletedPs.length){
    const rows=[
-    ...livePs.map(x=>({id:String(x.id),seller_id:me.id,title:String(x.title||'Untitled'),description:sePackProductDescription(x),price:Number(x.price||0),status:(x.publicLive===true || String(x.approvalStatus||'APPROVED').toUpperCase()==='APPROVED')?'active':(String(x.approvalStatus||'').toUpperCase()==='REJECTED'||x.hiddenByAdmin===true?'pending':'active'),file_url:x.links?.[0]||x.deliveryUrl||null,image_url:x.image||null})),
-    ...deletedPs.map(x=>({id:String(x.id),seller_id:me.id,title:String(x.title||'Untitled'),description:sePackProductDescription(x),price:Number(x.price||0),status:'deleted',file_url:x.links?.[0]||x.deliveryUrl||null,image_url:x.image||null}))
+    ...livePs.map(x=>seProductCloudRow(x,me.id,(x.publicLive===true || String(x.approvalStatus||'APPROVED').toUpperCase()==='APPROVED')?'active':(String(x.approvalStatus||'').toUpperCase()==='REJECTED'||x.hiddenByAdmin===true?'pending':'active'))),
+    ...deletedPs.map(x=>seProductCloudRow(x,me.id,'deleted'))
    ];
    const dedup=[...new Map(rows.map(x=>[String(x.id),x])).values()];
    const r=await supabaseClient.from('products').upsert(dedup,{onConflict:'id'});
    if(r.error)console.warn('products sync:',r.error.message);
+   else for(const productRow of livePs)await seSyncProductFiles(productRow,me.id);
   }
   const buyerIds=new Set([me.id,u?.id,u?.userId].filter(Boolean).map(String));
   // Buyers create their own normalized order rows. Sellers read those rows through RLS;
@@ -3757,11 +3809,11 @@ async function seSyncPublishedProduct(productId, attempts=3){
  if(!p)return false;
  const owner=normalizedCurrentOwnerId(p.sellerId);
  if(!owner)return false;
- const row={id:String(p.id),seller_id:owner,title:String(p.title||'Untitled'),description:sePackProductDescription(p),price:Number(p.price||0),status:(p.publicLive===true||String(p.approvalStatus||'APPROVED').toUpperCase()==='APPROVED')?'active':(String(p.approvalStatus||'').toUpperCase()==='REJECTED'||p.hiddenByAdmin===true?'pending':'active'),file_url:p.links?.[0]||p.deliveryUrl||null,image_url:p.image||null};
+ const row=seProductCloudRow(p,owner,(p.publicLive===true||String(p.approvalStatus||'APPROVED').toUpperCase()==='APPROVED')?'active':(String(p.approvalStatus||'').toUpperCase()==='REJECTED'||p.hiddenByAdmin===true?'pending':'active'));
  for(let i=0;i<Math.max(1,attempts);i++){
   try{
    const r=await supabaseClient.from('products').upsert(row,{onConflict:'id'});
-   if(!r.error){queueNormalizedSync(['products']);return true;}
+   if(!r.error){await seSyncProductFiles(p,owner);return true;}
    console.warn('Immediate product sync failed:',r.error.message||r.error);
   }catch(e){console.warn('Immediate product sync failed:',e?.message||e)}
   if(i<attempts-1)await new Promise(r=>setTimeout(r,500*(i+1)));
@@ -4052,11 +4104,11 @@ async function seLoadPublicCatalog(force=false){
          schemas may not have those physical columns. Never let an optional metadata
          column turn the entire anonymous marketplace into an empty catalog. */
       let pr=await supabaseClient.from('products')
-        .select('id,seller_id,title,description,price,status,file_url,image_url,created_at')
+        .select('id,seller_id,title,description,price,status,file_url,image_url,category,tags,old_price,file_size_value,file_size_unit,file_count,file_titles,faq,coupon,metadata,created_at,updated_at')
         .eq('status','active').order('created_at',{ascending:false});
       if(pr.error){
         const msg=String(pr.error.message||pr.error.code||'');
-        if(/column .*?(category|tags).*does not exist|schema cache|42703/i.test(msg)){
+        if(/column .*?(category|tags|old_price|file_size|file_titles|faq|coupon|metadata|updated_at).*does not exist|schema cache|42703/i.test(msg)){
           pr=await supabaseClient.from('products')
             .select('id,seller_id,title,description,price,status,file_url,image_url,created_at')
             .eq('status','active').order('created_at',{ascending:false});
@@ -4067,9 +4119,8 @@ async function seLoadPublicCatalog(force=false){
       const deleted=deletedProductIdSet();
       SE_PUBLIC_CATALOG=(pr.data||[]).filter(row=>!deleted.has(String(row.id))&&String(row.status||'').toLowerCase()==='active').map(row=>{
         const old=oldById.get(String(row.id))||{};
-        const decoded=seUnpackProductDescription(row.description);
-        const meta=decoded.meta||{};
-        return {...old,...meta,
+        const merged=seApplyCloudProductMetadata(old,row);
+        return {...merged,
           id:String(row.id),
           sellerId:(typeof seLocalSellerFromAuth==='function'&&seLocalSellerFromAuth(row.seller_id))||row.seller_id,
           title:row.title||old.title||'Untitled',
@@ -4081,9 +4132,10 @@ async function seLoadPublicCatalog(force=false){
           hiddenByAdmin:false,
           createdAt:old.createdAt||row.created_at||nowISO(),
           image:old.image||row.image_url||'',
-          category:row.category||old.category||'Other',
-          tags:Array.isArray(row.tags)?row.tags:(Array.isArray(old.tags)?old.tags:[]),
-          links:old.links||((row.file_url?[row.file_url]:[]))
+          category:merged.category||'',
+          tags:Array.isArray(merged.tags)?merged.tags:[],
+          oldPrice:merged.oldPrice??null,fileSizeValue:merged.fileSizeValue??null,fileSizeUnit:merged.fileSizeUnit||null,fileSize:merged.fileSize||'',fileCount:merged.fileCount||0,linkTitles:Array.isArray(merged.linkTitles)?merged.linkTitles:[],faq:Array.isArray(merged.faq)?merged.faq:[],coupon:merged.coupon||null,
+          links:Array.isArray(merged.links)?merged.links:[]
         };
       });
       SE_PUBLIC_CATALOG_READY=true;
@@ -4684,7 +4736,7 @@ async function refreshPublicRealtimeData(){
   // Production products table does not expose category/tags as physical columns.
   // Keep the public refresh schema-compatible and merge optional metadata from the
   // last known local/public row instead of making the whole catalog fail with 400.
-  const pr=await supabaseClient.from('products').select('id,seller_id,title,description,price,status,file_url,image_url,created_at').eq('status','active').order('created_at',{ascending:false});
+  const pr=await supabaseClient.from('products').select('id,seller_id,title,description,price,status,file_url,image_url,category,tags,old_price,file_size_value,file_size_unit,file_count,file_titles,faq,coupon,metadata,created_at,updated_at').eq('status','active').order('created_at',{ascending:false});
   if(pr.error)throw pr.error;
   const source=[];
   if(Array.isArray(SE_PUBLIC_CATALOG))source.push(...SE_PUBLIC_CATALOG);
@@ -4695,8 +4747,8 @@ async function refreshPublicRealtimeData(){
   for(const row of (pr.data||[])){
    const id=String(row.id);
    if(deleted.has(id))continue;
-   const old=oldById.get(id)||{};
-   next.push({...old,id,title:row.title??old.title??'Untitled',description:row.description??old.description??'',price:Number(row.price??old.price??0),status:'active',approvalStatus:'APPROVED',publicLive:true,hiddenByAdmin:false,sellerId:(typeof seLocalSellerFromAuth==='function'&&seLocalSellerFromAuth(row.seller_id))||row.seller_id||old.sellerId||null,createdAt:old.createdAt||row.created_at||nowISO(),image:old.image||row.image_url||'',category:old.category||'Other',tags:Array.isArray(old.tags)?old.tags:[],links:old.links||((row.file_url?[row.file_url]:[]))});
+   const old=oldById.get(id)||{},merged=seApplyCloudProductMetadata(old,row);
+   next.push({...merged,id,title:row.title??old.title??'Untitled',description:merged.description??old.description??'',price:Number(row.price??old.price??0),status:'active',approvalStatus:'APPROVED',publicLive:true,hiddenByAdmin:false,sellerId:(typeof seLocalSellerFromAuth==='function'&&seLocalSellerFromAuth(row.seller_id))||row.seller_id||old.sellerId||null,createdAt:old.createdAt||row.created_at||nowISO(),image:old.image||row.image_url||''});
   }
   SE_PUBLIC_CATALOG=next;
   SE_PUBLIC_CATALOG_READY=true;
@@ -5842,7 +5894,7 @@ function detail(id){
  return `${header()}<main class="page"><div class="container detail-wrap">
  <button class="btn" onclick="goBack()">← Back</button>
  <div class="detail-main" style="margin-top:15px">${thumbLarge(p)}<div class="detail-info"><div>${(p.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}</div><h1>${esc(p.title)}</h1><div class="stars">${stars(Math.round(Number(avg)||0))} <span class="muted">${rs.length?avg+" / 5 · "+rs.length+" reviews":"No reviews yet"}</span></div><div class="detail-price">${money(p.price)} ${p.oldPrice?`<span class="old">${money(p.oldPrice)}</span>`:""}</div><div class="detail-sales-line"><span>✓ Verified sales</span><b>${productSales(p.id)}</b><span>sales</span></div>${(()=>{const descText=String(p.description||"Digital product with instant delivery.");const showToggle=descText.length>180;return `<div class="product-description-wrap"><p class="desc product-description-text">${esc(descText)}</p>${showToggle?`<button type="button" class="product-description-toggle" onclick="toggleProductDescription(this)" aria-expanded="false">More ↓</button>`:''}</div>`})()}
- <div class="detail-actions"><button class="btn primary" onclick="${hasPurchased(p.id)?`openPurchasedByProduct('${p.id}')`:`buyNow('${p.id}')`} ">${hasPurchased(p.id)?"Check":"Buy Now"}</button><button class="btn" onclick="addCart('${p.id}')">Add to Cart</button><button class="btn" onclick="shareProduct('${p.id}')">↗ Share</button></div><div class="product-trust-row"><span class="product-trust-pill">✓ Digital product</span><span class="product-trust-pill">✓ Secure checkout</span><span class="product-trust-pill">✓ Admin-reviewed listing</span><span class="product-trust-pill">✓ Online delivery</span></div><div class="dash-card" style="margin:12px 0"><h3 style="margin-top:0">What’s Inside</h3><div class="stats"><span><b>${p.fileCount||((p.links||[]).length||1)}</b> Files</span><span><b>${esc(p.fileSize||"250 MB")}</b> Size</span><span><b>${esc(p.category)}</b> Type</span></div><p class="small muted">Seller listing: @${esc(s.id)} · ${esc(s.name)}</p></div>
+ <div class="detail-actions"><button class="btn primary" onclick="${hasPurchased(p.id)?`openPurchasedByProduct('${p.id}')`:`buyNow('${p.id}')`} ">${hasPurchased(p.id)?"Check":"Buy Now"}</button><button class="btn" onclick="addCart('${p.id}')">Add to Cart</button><button class="btn" onclick="shareProduct('${p.id}')">↗ Share</button></div><div class="product-trust-row"><span class="product-trust-pill">✓ Digital product</span><span class="product-trust-pill">✓ Secure checkout</span><span class="product-trust-pill">✓ Admin-reviewed listing</span><span class="product-trust-pill">✓ Online delivery</span></div><div class="dash-card" style="margin:12px 0"><h3 style="margin-top:0">What’s Inside</h3><div class="stats"><span><b>${p.fileCount||((p.links||[]).length||1)}</b> Files</span><span><b>${esc(p.fileSize||"Not specified")}</b> Size</span><span><b>${esc(p.category||"Not specified")}</b> Type</span></div>${(()=>{const names=(Array.isArray(p.linkTitles)?p.linkTitles:[]).map((x,i)=>String(x||'').trim()||`File ${i+1}`).slice(0,Math.max(1,Number(p.fileCount||p.links?.length||1)));return names.length?`<div class="public-file-name-list"><div class="small muted public-file-name-heading">Included file${names.length===1?'':'s'}</div>${names.map((name,i)=>`<div class="public-file-name"><span>📄</span><b>${esc(name)}</b></div>`).join('')}</div>`:''})()}<p class="small muted">Seller listing: @${esc(s.id)} · ${esc(s.name)}</p></div>
  <div class="seller-box" onclick="go('seller/${s.id}')" style="cursor:pointer">${avatar(s)}<div><b>${esc(s.name)}</b><div class="small muted">@${esc(s.id)} · ${s.followers||0} followers</div></div></div>
  <div class="faq"><button onclick="toggleFaq(this)">What is included? <span class="chev">⌄</span></button><div class="faq-content">${esc((p.links||[]).length)} secure delivery link(s) and the product details shown here.</div></div><div class="broken-link-box"><b>Delivery issue?</b><p class="small muted" style="margin:5px 0 9px">If a delivery link is unavailable or does not match the listing, report it to Sale Earn support.</p><button class="btn" onclick="reportProductIssue('${p.id}')">Report delivery issue</button></div>
  ${(p.faq||[]).map(f=>`<div class="faq"><button onclick="toggleFaq(this)">${esc(f[0])}<span class="chev">⌄</span></button><div class="faq-content">${esc(f[1])}</div></div>`).join("")}
@@ -6820,11 +6872,11 @@ function adminDeleted(){
 }
 async function hydrateAdminDeletedProducts(){
  if(!adminOnly()||!window.supabaseClient)return;
- const r=await supabaseClient.from('products').select('id,seller_id,title,description,price,status,file_url,image_url,created_at').eq('status','deleted').order('created_at',{ascending:false});
+ const r=await supabaseClient.from('products').select('id,seller_id,title,description,price,status,file_url,image_url,category,tags,old_price,file_size_value,file_size_unit,file_count,file_titles,faq,coupon,metadata,created_at,updated_at').eq('status','deleted').order('created_at',{ascending:false});
  if(r.error){console.warn('Deleted products query failed:',r.error.message);return;}
  const known=new Set((S.deletedProducts||[]).map(p=>String(p.id)));
  for(const row of (r.data||[])){
-  if(!known.has(String(row.id)))S.deletedProducts.unshift({id:String(row.id),sellerId:row.seller_id,title:row.title||'Untitled',description:row.description||'',price:Number(row.price||0),status:'deleted',links:row.file_url?[row.file_url]:[],image:row.image_url||'',createdAt:row.created_at||nowISO(),deletedAt:nowISO(),recycledFrom:'live'});
+  if(!known.has(String(row.id))){const merged=seApplyCloudProductMetadata({},row);S.deletedProducts.unshift({...merged,id:String(row.id),sellerId:row.seller_id,title:row.title||'Untitled',description:merged.description||'',price:Number(row.price||0),status:'deleted',image:row.image_url||'',createdAt:row.created_at||nowISO(),deletedAt:nowISO(),recycledFrom:'live'});}
  }
  const el=document.getElementById('recycleList');if(el)el.innerHTML=adminRecycleRows(S.deletedProducts||[]);
 }
@@ -11877,17 +11929,16 @@ window.seGuardNonAdmin=function(sent,remote){
 window.saleEarnHydrateAdminProducts=async function(){
  if(!isAdm()||!window.supabaseClient)return false;
  try{
-  const r=await window.supabaseClient.from('products').select('id,seller_id,title,description,price,status,file_url,image_url,created_at').order('created_at',{ascending:false});
+  const r=await window.supabaseClient.from('products').select('id,seller_id,title,description,price,status,file_url,image_url,category,tags,old_price,file_size_value,file_size_unit,file_count,file_titles,faq,coupon,metadata,created_at,updated_at').order('created_at',{ascending:false});
   if(r.error)throw r.error;
   const existing=mapById(S.products);
   const deletedIds=new Set((Array.isArray(S.productTombstones)?S.productTombstones:[]).map(x=>String(x?.id)));
   for(const row of (r.data||[])){
    const id=String(row.id);
    if(deletedIds.has(id))continue;
-   const old=existing.get(id)||{};
-   const decoded=seUnpackProductDescription(row.description),meta=decoded.meta||{};
+   const old=existing.get(id)||{},merged=seApplyCloudProductMetadata(old,row);
    const sid=(typeof seLocalSellerFromAuth==='function'&&seLocalSellerFromAuth(row.seller_id))||row.seller_id||old.sellerId||null;
-   existing.set(id,{...old,...meta,id,title:row.title??old.title??'Untitled',description:decoded.description??old.description??'',price:Number(row.price??old.price??0),status:old.status||row.status||'active',sellerId:sid,createdAt:old.createdAt||row.created_at||nowISO(),image:old.image||row.image_url||'',links:old.links||((row.file_url?[row.file_url]:[]))});
+   existing.set(id,{...merged,id,title:row.title??old.title??'Untitled',description:merged.description??old.description??'',price:Number(row.price??old.price??0),status:old.status||row.status||'active',sellerId:sid,createdAt:old.createdAt||row.created_at||nowISO(),image:old.image||row.image_url||''});
   }
   S.products=[...existing.values()].filter(p=>!deletedIds.has(String(p?.id)));
   sePersist();
@@ -12055,20 +12106,13 @@ window.adminProductCheckAction=async function(id,kind){
             if(!er.error)existing=er.data||null;
           }catch{}
           const owner=existing?.seller_id || normalizedOwnerId(decided.sellerId) || sellerOwnerUser(decided.sellerId)?.authId || sellerOwnerUser(decided.sellerId)?.id;
-          const syncRow={
-            id:String(decided.id),
-            title:String(decided.title||'Untitled'),
-            description:sePackProductDescription(decided),
-            price:Number(decided.price||0),
-            status:kind==='reject'?'pending':'active',
-            file_url:decided.links?.[0]||decided.deliveryUrl||null,
-            image_url:decided.image||null
-          };
-          if(owner)syncRow.seller_id=owner;
+          const syncRow=seProductCloudRow(decided,owner||existing?.seller_id||null,kind==='reject'?'pending':'active');
+          if(!syncRow.seller_id)delete syncRow.seller_id;
           const wr=existing
             ? await window.supabaseClient.from('products').update(syncRow).eq('id',String(pid))
             : (owner ? await window.supabaseClient.from('products').insert({...syncRow,seller_id:owner}) : {error:new Error('Seller owner ID could not be resolved')});
           if(wr.error)throw wr.error;
+          if(owner)await seSyncProductFiles(decided,owner);
         }
         /* Do not wait for a second full catalog fetch to make the approved item
            visible.  Admin approval is already authoritative in Supabase; update the
@@ -13601,3 +13645,52 @@ window.publishProduct=function(id){
 };
 })();
 </script>
+
+<script>
+/* Marketplace metadata display fix: the public catalog row is intentionally
+   lightweight. Merge it with the complete local/shared product record whenever
+   one is available, while keeping public visibility/moderation fields authoritative. */
+(function(){
+'use strict';
+if(window.__seMarketplaceMetadataDisplayFinal)return;
+window.__seMarketplaceMetadataDisplayFinal=true;
+const baseProduct=product;
+const metadataKeys=['title','description','category','tags','oldPrice','links','linkTitles','fileSizeValue','fileSizeUnit','fileSize','fileCount','faq','coupon','rightsConfirmed','image','badge','featured'];
+product=function(id){
+  const visible=baseProduct(id);
+  if(!visible)return visible;
+  const full=(Array.isArray(S.products)?S.products:[]).find(x=>String(x?.id)===String(id));
+  if(!full||full===visible)return visible;
+  const merged={...visible};
+  for(const key of metadataKeys){
+    if(Object.prototype.hasOwnProperty.call(full,key)){
+      try{merged[key]=structuredClone(full[key])}catch{merged[key]=full[key]}
+    }
+  }
+  /* Never let a local cache bypass marketplace moderation/visibility. */
+  for(const key of ['status','approvalStatus','publicLive','hiddenByAdmin']){
+    if(Object.prototype.hasOwnProperty.call(visible,key))merged[key]=visible[key];
+  }
+  return merged;
+};
+/* Repair old normalized rows once a signed-in seller/admin has the complete
+   shared product records. This also upgrades already-published products. */
+setTimeout(()=>{
+  try{
+    if(S.currentUser&&Array.isArray(S.products)&&S.products.length){
+      queueNormalizedSync?.(['products']);
+      for(const p of S.products){
+        if(!p?.id)continue;
+        window.seSyncPublishedProduct?.(p.id,2);
+      }
+    }
+  }catch(e){console.warn('Existing product metadata repair delayed',e)}
+},900);
+})();
+</script>
+<style id="se-marketplace-file-names-final">
+.public-file-name-list{display:grid;gap:7px;margin:14px 0 4px;padding-top:12px;border-top:1px solid var(--line,#2a3850)}
+.public-file-name-heading{font-weight:800;text-transform:uppercase;letter-spacing:.06em}
+.public-file-name{display:flex;align-items:center;gap:9px;min-width:0;padding:9px 10px;border:1px solid var(--line,#2a3850);border-radius:10px;background:var(--soft,#111c2f)}
+.public-file-name span{flex:0 0 auto}.public-file-name b{min-width:0;overflow-wrap:anywhere;font-size:12px}
+</style>
