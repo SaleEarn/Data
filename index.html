@@ -3735,7 +3735,7 @@ function seApplyCloudProductMetadata(base,row){
  const sizeUnit=row?.file_size_unit??packed.fileSizeUnit??old.fileSizeUnit;
  const links=Array.isArray(old.links)&&old.links.length?old.links:(Array.isArray(packed.links)&&packed.links.length?packed.links:(row?.file_url?[row.file_url]:[]));
  return {...old,...packed,
-  description:merged.description??old.description??'',category:row?.category??packed.category??old.category??'',tags,
+  description:decoded.description??old.description??'',category:row?.category??packed.category??old.category??'',tags,
   oldPrice:row?.old_price??packed.oldPrice??old.oldPrice,fileSizeValue:sizeValue,fileSizeUnit:sizeUnit,
   fileSize:(sizeValue&&sizeUnit)?`${Number(sizeValue)} ${sizeUnit}`:(packed.fileSize||old.fileSize||''),
   fileCount:Number(row?.file_count??packed.fileCount??old.fileCount??links.length),
@@ -4093,6 +4093,37 @@ async function seRepairDeletedPublicRows(){
   }
 }
 
+async function seHydrateAuthorizedProductFiles(){
+ if(!S.currentUser||!supabaseClient||!Array.isArray(SE_PUBLIC_CATALOG)||!SE_PUBLIC_CATALOG.length)return false;
+ const ids=SE_PUBLIC_CATALOG.map(x=>String(x?.id||'')).filter(Boolean).slice(0,200);
+ if(!ids.length)return false;
+ try{
+  const r=await supabaseClient.from('product_files').select('product_id,title,secret_url,file_size_value,file_size_unit,position').in('product_id',ids).order('position',{ascending:true});
+  if(r.error)throw r.error;
+  const grouped=new Map();
+  for(const row of (r.data||[])){const id=String(row.product_id);if(!grouped.has(id))grouped.set(id,[]);grouped.get(id).push(row)}
+  const apply=list=>(Array.isArray(list)?list:[]).map(p=>{
+   const files=grouped.get(String(p?.id));if(!files?.length)return p;
+   const sizeValue=files[0].file_size_value??p.fileSizeValue,sizeUnit=files[0].file_size_unit??p.fileSizeUnit;
+   return {...p,links:files.map(x=>x.secret_url),linkTitles:files.map((x,i)=>x.title||`File ${i+1}`),fileCount:files.length,fileSizeValue:sizeValue,fileSizeUnit:sizeUnit,fileSize:(sizeValue&&sizeUnit)?`${Number(sizeValue)} ${sizeUnit}`:p.fileSize};
+  });
+  SE_PUBLIC_CATALOG=apply(SE_PUBLIC_CATALOG);S.products=apply(S.products);
+  return true;
+ }catch(e){console.warn('Authorized product files read failed:',e?.message||e);return false}
+}
+function seHydrateLocalProductsFromCatalog(){
+ if(!Array.isArray(SE_PUBLIC_CATALOG)||!Array.isArray(S.products))return;
+ const cloudById=new Map(SE_PUBLIC_CATALOG.map(x=>[String(x?.id),x]));
+ const fields=['title','description','price','oldPrice','category','tags','image','fileSizeValue','fileSizeUnit','fileSize','fileCount','linkTitles','faq','coupon','rightsConfirmed','badge','featured'];
+ S.products=S.products.map(local=>{
+  const cloud=cloudById.get(String(local?.id));if(!cloud)return local;
+  const next={...local};for(const key of fields)if(Object.prototype.hasOwnProperty.call(cloud,key)){try{next[key]=structuredClone(cloud[key])}catch{next[key]=cloud[key]}}
+  if(Array.isArray(cloud.links)&&cloud.links.length)next.links=cloud.links.slice();
+  return next;
+ });
+ try{sePersist()}catch(e){}
+}
+
 async function seLoadPublicCatalog(force=false){
   if(!supabaseClient || !SUPABASE_READY)return false;
   if(SE_PUBLIC_CATALOG_READY && !force)return true;
@@ -4106,14 +4137,6 @@ async function seLoadPublicCatalog(force=false){
       let pr=await supabaseClient.from('products')
         .select('id,seller_id,title,description,price,status,file_url,image_url,category,tags,old_price,file_size_value,file_size_unit,file_count,file_titles,faq,coupon,metadata,created_at,updated_at')
         .eq('status','active').order('created_at',{ascending:false});
-      if(pr.error){
-        const msg=String(pr.error.message||pr.error.code||'');
-        if(/column .*?(category|tags|old_price|file_size|file_titles|faq|coupon|metadata|updated_at).*does not exist|schema cache|42703/i.test(msg)){
-          pr=await supabaseClient.from('products')
-            .select('id,seller_id,title,description,price,status,file_url,image_url,created_at')
-            .eq('status','active').order('created_at',{ascending:false});
-        }
-      }
       if(pr.error)throw pr.error;
       const oldById=new Map((Array.isArray(S.products)?S.products:[]).map(x=>[String(x?.id),x]));
       const deleted=deletedProductIdSet();
@@ -4124,7 +4147,7 @@ async function seLoadPublicCatalog(force=false){
           id:String(row.id),
           sellerId:(typeof seLocalSellerFromAuth==='function'&&seLocalSellerFromAuth(row.seller_id))||row.seller_id,
           title:row.title||old.title||'Untitled',
-          description:decoded.description??old.description??'',
+          description:merged.description??old.description??'',
           price:Number(row.price??old.price??0),
           status:'active',
           approvalStatus:'APPROVED',
@@ -4138,21 +4161,18 @@ async function seLoadPublicCatalog(force=false){
           links:Array.isArray(merged.links)?merged.links:[]
         };
       });
+      await seHydrateAuthorizedProductFiles();
+      seHydrateLocalProductsFromCatalog();
       SE_PUBLIC_CATALOG_READY=true;
       PUBLIC_PRODUCTS_READY=true;
       try{await seLoadRealProductSalesCounts(true)}catch(e){console.warn('Public sales count hydration:',e?.message||e)}
       try{const currentRoute=routeNow();if(currentRoute==='market'||currentRoute.startsWith('product/')||currentRoute.startsWith('seller/'))setTimeout(()=>render(),0)}catch(e){}
       return true;
     }catch(e){
-      const fallback=(Array.isArray(SE_PUBLIC_CATALOG)&&SE_PUBLIC_CATALOG.length)
-        ? SE_PUBLIC_CATALOG
-        : (Array.isArray(S.products)?S.products.filter(x=>x&&String(x.status||'active').toLowerCase()!=='deleted' && !(typeof deletedProductIdSet==='function'&&deletedProductIdSet().has(String(x.id)))):[]);
-      if(Array.isArray(fallback)&&fallback.length){
-        SE_PUBLIC_CATALOG=fallback;
-        SE_PUBLIC_CATALOG_READY=true;
-        PUBLIC_PRODUCTS_READY=true;
-      }
-      console.warn('Public catalog load failed; keeping last known good catalog',e?.message||e);
+      console.error('Supabase product catalog read failed:',e?.message||e);
+      SE_PUBLIC_CATALOG_READY=Array.isArray(SE_PUBLIC_CATALOG)&&SE_PUBLIC_CATALOG.length>0;
+      PUBLIC_PRODUCTS_READY=SE_PUBLIC_CATALOG_READY;
+      if(!window.__seCatalogReadErrorShown){window.__seCatalogReadErrorShown=true;toast('Supabase product read failed: '+String(e?.message||'unknown error'));}
       return false;
     }finally{SE_PUBLIC_CATALOG_PROMISE=null}
   })();
@@ -4890,12 +4910,13 @@ function product(id){
   if(deleted.has(key))return null;
   /* Admin moderation/detail views must be able to inspect Pending/Rejected
      records. Public buyers use the authoritative public catalog whenever it is ready. */
-  const source=(typeof isAdmin==='function' && isAdmin())
+  const adminWorkspaceRoute=routeNow().startsWith('admin');
+  const source=(typeof isAdmin==='function' && isAdmin() && adminWorkspaceRoute)
     ? (Array.isArray(S.products)?S.products:[])
     : (SE_PUBLIC_CATALOG_READY && Array.isArray(SE_PUBLIC_CATALOG) ? SE_PUBLIC_CATALOG : (Array.isArray(S.products)?S.products:[]));
   const p=source.find(p=>String(p?.id)===key);
   if(!p)return null;
-  if(typeof isAdmin==='function' && isAdmin())return p;
+  if(typeof isAdmin==='function' && isAdmin() && adminWorkspaceRoute)return p;
   if(String(p.status||'').toLowerCase()!=='active')return null;
   if(!S.currentUser){
     if(!PUBLIC_PRODUCTS_READY)return null;
