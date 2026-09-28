@@ -11310,11 +11310,25 @@ async function v9CouponServer(action,payload={}){
   if(!window.supabaseClient?.rpc)throw new Error('Secure coupon database is not connected');
   let fn=null,args={};
   if(action==='validate'){
+    const context=String(payload.context||'PRODUCT').toUpperCase();
+    const productId=payload.product_id?String(payload.product_id):null;
+    const code=String(payload.code||'').trim().toUpperCase();
+    /* Seller-created coupons live on products.coupon. Validate those first with
+       the dedicated server-side RPC; unmatched codes may still be Admin coupons. */
+    if(context==='PRODUCT'&&productId&&code){
+      const sellerResult=await window.supabaseClient.rpc('saleearn_validate_product_coupon',{p_product_id:productId,p_code:code});
+      if(sellerResult.error)throw new Error(sellerResult.error.message||sellerResult.error.details||'Seller coupon validation failed');
+      const sellerCoupon=sellerResult.data||{};
+      if(sellerCoupon.matched===true){
+        if(sellerCoupon.ok!==true)throw new Error(sellerCoupon.message||'Seller coupon is unavailable');
+        return sellerCoupon;
+      }
+    }
     fn='public_validate_coupon';
     args={
-      p_code:String(payload.code||'').trim().toUpperCase(),
-      p_context:String(payload.context||'PRODUCT').toUpperCase(),
-      p_product_id:payload.product_id?String(payload.product_id):null,
+      p_code:code,
+      p_context:context,
+      p_product_id:productId,
       p_base_amount:payload.base_amount==null?null:Number(payload.base_amount),
       p_placement:payload.placement?String(payload.placement):null
     };
