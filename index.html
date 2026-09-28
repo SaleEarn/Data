@@ -3765,8 +3765,8 @@ async function syncNormalizedCore(){
    const r=await supabaseClient.from('sellers').upsert({user_id:me.id,store_name:ss.name||ss.storeName||'',status:ss.suspended?'suspended':'active'},{onConflict:'user_id'});
    if(r.error)console.warn('sellers sync:',r.error.message);
   }
-  const livePs=needs.has('products')?(S.products||[]).filter(x=>normalizedCurrentOwnerId(x.sellerId)===me.id):[];
-  const deletedPs=needs.has('products')?(S.deletedProducts||[]).filter(x=>normalizedCurrentOwnerId(x?.sellerId)===me.id):[];
+  const livePs=[]; // Dedicated product RPC owns seller product writes; never push a stale background cache.
+  const deletedPs=[];
   if(livePs.length||deletedPs.length){
    const rows=[
     ...livePs.map(x=>seProductCloudRow(x,me.id,(x.publicLive===true || String(x.approvalStatus||'APPROVED').toUpperCase()==='APPROVED')?'active':(String(x.approvalStatus||'').toUpperCase()==='REJECTED'||x.hiddenByAdmin===true?'pending':'active'))),
@@ -13584,6 +13584,34 @@ try{const a=readAttempts();if(a.length&&!window.__seLoginAttemptsLoaded){window.
 </script>
 
 <script>
+async function seSaveProductSecureRpc(product){
+ if(!window.supabaseClient||!product?.id)return false;
+ const links=Array.isArray(product.links)?product.links.map(x=>String(x||'').trim()).filter(Boolean):[];
+ const titles=Array.isArray(product.linkTitles)?product.linkTitles:[];
+ const payload={
+  id:String(product.id),title:String(product.title||'').trim(),description:seUnpackProductDescription(product.description).description,
+  price:Number(product.price||0),old_price:Number(product.oldPrice||0)||null,
+  status:(product.publicLive===true&&product.hiddenByAdmin!==true)?'active':'pending',
+  file_url:links[0]||null,image_url:product.image||null,category:product.category||null,
+  tags:Array.isArray(product.tags)?product.tags:[],file_size_value:Number(product.fileSizeValue||0)||null,
+  file_size_unit:['MB','GB'].includes(String(product.fileSizeUnit||''))?String(product.fileSizeUnit):null,
+  file_count:links.length||Number(product.fileCount||0),file_titles:links.map((_,i)=>String(titles[i]||`File ${i+1}`)),
+  faq:Array.isArray(product.faq)?product.faq:[],coupon:product.coupon||null,
+  metadata:{rightsConfirmed:!!product.rightsConfirmed,badge:product.badge||null,featured:!!product.featured},
+  files:links.map((url,i)=>({title:String(titles[i]||`File ${i+1}`),url}))
+ };
+ try{
+  const {data,error}=await supabaseClient.rpc('saleearn_save_product',{p_product:payload});
+  if(error)throw error;
+  return data?.ok===true;
+ }catch(e){
+  console.error('Secure product save failed:',e);
+  toast('Supabase save failed: '+String(e?.message||'unknown error'));
+  return false;
+ }
+}
+window.seSaveProductSecureRpc=seSaveProductSecureRpc;
+
 /* Final product persistence hardening: keep every seller-entered field intact
    through publish, navigation, public-catalog refresh and cloud synchronization. */
 (function(){
@@ -13636,10 +13664,11 @@ window.publishProduct=function(id){
   }catch(e){console.warn('Public product cache update delayed',e)}
   try{sePersist();save()}catch(e){console.warn('Final product snapshot save delayed',e)}
   Promise.resolve().then(async()=>{
-    try{await window.seSyncPublishedProduct?.(target.id,5)}catch(e){console.warn('Final product row sync delayed',e)}
+    const saved=await seSaveProductSecureRpc(target);
+    if(saved){toast('Product details saved securely to Supabase');}
     try{
       if(typeof ONLINE_LOCAL_DIRTY!=='undefined'&&ONLINE_LOCAL_DIRTY&&typeof pushOnlineState==='function')await pushOnlineState();
-    }catch(e){console.warn('Final product cloud snapshot delayed',e)}
+    }catch(e){console.warn('Shared snapshot save delayed',e)}
   });
   return result;
 };
@@ -13673,19 +13702,6 @@ product=function(id){
   }
   return merged;
 };
-/* Repair old normalized rows once a signed-in seller/admin has the complete
-   shared product records. This also upgrades already-published products. */
-setTimeout(()=>{
-  try{
-    if(S.currentUser&&Array.isArray(S.products)&&S.products.length){
-      queueNormalizedSync?.(['products']);
-      for(const p of S.products){
-        if(!p?.id)continue;
-        window.seSyncPublishedProduct?.(p.id,2);
-      }
-    }
-  }catch(e){console.warn('Existing product metadata repair delayed',e)}
-},900);
 })();
 </script>
 <style id="se-marketplace-file-names-final">
